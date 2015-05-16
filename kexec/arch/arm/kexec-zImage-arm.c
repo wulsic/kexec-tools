@@ -22,6 +22,7 @@
 #include "../../kexec-syscall.h"
 #include "crashdump-arm.h"
 #include "../../fs2dt.h"
+#include "mach.h"
 
 off_t initrd_base = 0, initrd_size = 0;
 
@@ -88,10 +89,10 @@ struct tag {
 
 int zImage_arm_probe(const char *UNUSED(buf), off_t UNUSED(len))
 {
-	/* 
+	/*
 	 * Only zImage loading is supported. Do not check if
 	 * the buffer is valid kernel image
-	 */	
+	 */
 	return 0;
 }
 
@@ -103,6 +104,7 @@ void zImage_arm_usage(void)
 		"     --ramdisk=FILE        Use FILE as the kernel's initial ramdisk.\n"
 		"     --dtb(=dtb.img)       Load dtb from zImage, dtb.img or /proc/device-tree instead of using atags.\n"
 		"                           DTB appended to zImage and dtb.img currently only works on MSM devices.\n"
+		"     --boardname=NAME      Required if using DTB. Options: hammerhead bacon d851 shamu\n"
 		"     --rd-addr=<addr>      Address to load initrd to.\n"
 		"     --atags-addr=<addr>   Address to load atags/dtb to.\n"
 		);
@@ -117,7 +119,7 @@ struct tag * atag_read_tags(void)
 	const char fn[]= "/proc/atags";
 	int fd = open(fn, O_RDONLY);
 	if (fd == -1) {
-		fprintf(stderr, "Cannot open %s: %s\n", 
+		fprintf(stderr, "Cannot open %s: %s\n",
 			fn, strerror(errno));
 		return NULL;
 	}
@@ -307,6 +309,7 @@ static uint32_t dtb_compatible(void *dtb, struct msm_id *devid, struct msm_id *d
 
 	return 1;
 }
+#define DTB_PAD_SIZE            4096
 
 static int get_appended_dtb(const char *kernel, off_t kernel_len, char **dtb_img, off_t *dtb_img_len)
 {
@@ -515,6 +518,8 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 	char *dtb_buf;
 	off_t dtb_length;
 	off_t dtb_offset;
+	struct arm_mach *mach;
+
 	/* See options.h -- add any more there, too. */
 	static const struct option options[] = {
 		KEXEC_ARCH_OPTIONS
@@ -525,9 +530,10 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 		{ "dtb",		2, 0, OPT_DTB },
 		{ "rd-addr",		1, 0, OPT_RD_ADDR },
 		{ "atags-addr",		1, 0, OPT_ATAGS_ADDR },
+		{ "boardname",  1, 0, OPT_BOARDNAME },
 		{ 0, 			0, 0, 0 },
 	};
-	static const char short_options[] = KEXEC_ARCH_OPT_STR "a:r:d::i:g:";
+	static const char short_options[] = KEXEC_ARCH_OPT_STR "a:r:d::i:g:b:";
 
 	/*
 	 * Parse the command line arguments
@@ -540,6 +546,7 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 	dtb_file = NULL;
 	opt_ramdisk_addr = 0;
 	opt_atags_addr = 0;
+	mach = NULL;
 	while((opt = getopt_long(argc, argv, short_options, options, 0)) != -1) {
 		switch(opt) {
 		default:
@@ -568,7 +575,7 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 					"Bad option value in --rd-addr=%s\n",
 					optarg);
 				usage();
-				return 1;
+				return -1;
 			}
 			break;
 		case OPT_ATAGS_ADDR:
@@ -578,7 +585,15 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 					"Bad option value in --atag-addr=%s\n",
 					optarg);
 				usage();
-				return 1;
+				return -1;
+			}
+			break;
+		case OPT_BOARDNAME:
+			mach = arm_mach_choose(optarg);
+			if(!mach)
+			{
+				fprintf(stderr, "Unknown boardname '%s'!\n", optarg);
+				return -1;
 			}
 			break;
 		}
@@ -658,6 +673,12 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 		int free_dtb_img = 0;
 		int choose_res = 0;
 
+		if(!mach)
+		{
+			fprintf(stderr, "DTB: --boardname was not specified.\n");
+			return -1;
+		}
+
 		if(dtb_file)
 		{
 			if(!load_dtb_image(dtb_file, &dtb_img, &dtb_img_len))
@@ -674,7 +695,7 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 			printf("DTB: Using DTB appended to zImage\n");
 		}
 
-		choose_res = choose_dtb(dtb_img, dtb_img_len, &dtb_buf, &dtb_length);
+		choose_res = (mach->choose_dtb)(dtb_img, dtb_img_len, &dtb_buf, &dtb_length);
 
 		if(free_dtb_img)
 			free(dtb_img);
@@ -689,11 +710,12 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 			if(ret)
 				die("DTB: fdt_open_into failed");
 
-			ret = fdt_path_offset(dtb_buf, "/memory");
-			if (ret >= 0)
-				dtb_add_memory_reg(dtb_buf, ret);
-			else
-				fprintf(stderr, "DTB: Could not find memory node.\n");
+			ret = (mach->add_extra_regs)(dtb_buf);
+			if (ret < 0)
+			{
+				fprintf(stderr, "DTB: error while adding mach-specific extra regs\n");
+				return -1;
+			}
 
 			if (command_line) {
 				const char *node_name = "/chosen";
@@ -753,7 +775,7 @@ int zImage_arm_load(int argc, char **argv, const char *buf, off_t len,
 			/*
 			* Extract the DTB from /proc/device-tree.
 			*/
-			printf("DTB: Failed to load dtb from zImage or dtb.img, using /proc/device-tree\n");
+			printf("DTB: Failed to load dtb from zImage or dtb.img, using /proc/device-tree. This is unlikely to work.\n");
 			create_flatten_tree(&dtb_buf, &dtb_length, command_line);
 		}
 
